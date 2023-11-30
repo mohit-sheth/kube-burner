@@ -59,22 +59,14 @@ type GlobalConfig struct {
 	Measurements []mtypes.Measurement `yaml:"measurements"`
 	// RequestTimeout of restclient
 	RequestTimeout time.Duration `yaml:"requestTimeout"`
-	// PrometheusURL to interact with
-	PrometheusURL string `yaml:"prometheusURL"`
-	// BearerToken used to access prometheus
-	BearerToken string `yaml:"bearerToken"`
-	// MetricsProfile is the path to the metrics profile configuration
-	MetricsProfile string `yaml:"metricsProfile"`
-	// MetricsEndpoint is path to the metrics endpoint configuration YAML
-	MetricsEndpoint string `yaml:"metricsEndpoint"`
-	// AlertProfile is path to the alert profile
-	AlertProfile string `yaml:"alertProfile"`
 	// GC garbage collect created namespaces
 	GC bool `yaml:"gc" json:"gc"`
 	// WaitWhenFinished Wait for pods to be running when all the jobs are completed
 	WaitWhenFinished bool `yaml:"waitWhenFinished" json:"waitWhenFinished,omitempty"`
 	// GCTimeout garbage collection timeout
 	GCTimeout time.Duration `yaml:"gcTimeout"`
+	// Boolean flag to collect metrics during garbage collection
+	GCMetrics bool `yaml:"gcMetrics"`
 }
 
 // Object defines an object that kube-burner will create
@@ -156,6 +148,10 @@ type Job struct {
 	ChurnDuration time.Duration `yaml:"churnDuration" json:"churnDuration,omitempty"`
 	// Churn delay between sets
 	ChurnDelay time.Duration `yaml:"churnDelay" json:"churnDelay,omitempty"`
+	// Churn deletion strategy
+	ChurnDeletionStrategy string `yaml:"churnDeletionStrategy" json:"churnDeletionStrategy,omitempty"`
+	// Skip this job from indexing
+	SkipIndexing bool `yaml:"skipIndexing" json:"skipIndexing,omitempty"`
 }
 
 type WaitOptions struct {

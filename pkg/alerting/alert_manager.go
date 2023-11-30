@@ -54,11 +54,11 @@ type alertProfile []struct {
 
 // alert definition
 type alert struct {
-	Timestamp   time.Time `json:"timestamp"`
-	UUID        string    `json:"uuid"`
-	Severity    string    `json:"severity"`
-	Description string    `json:"description"`
-	MetricName  string    `json:"metricName"`
+	Timestamp   time.Time     `json:"timestamp"`
+	UUID        string        `json:"uuid"`
+	Severity    severityLevel `json:"severity"`
+	Description string        `json:"description"`
+	MetricName  string        `json:"metricName"`
 }
 
 // AlertManager configuration
@@ -183,10 +183,10 @@ func parseMatrix(value model.Value, description string, severity severityLevel) 
 				log.Error(msg.Error())
 				errs = append(errs, err)
 			}
-			msg := fmt.Sprintf("alert at %v: '%s'", val.Timestamp.Time().Format(time.RFC3339), renderedDesc.String())
+			msg := fmt.Sprintf("alert at %v: '%s'", val.Timestamp.Time().UTC().Format(time.RFC3339), renderedDesc.String())
 			alertSet = append(alertSet, alert{
-				Timestamp:   val.Timestamp.Time(),
-				Severity:    string(severity),
+				Timestamp:   val.Timestamp.Time().UTC(),
+				Severity:    severity,
 				Description: renderedDesc.String(),
 				MetricName:  alertMetricName,
 			})

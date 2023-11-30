@@ -53,8 +53,6 @@ type object struct {
 // Executor contains the information required to execute a job
 type Executor struct {
 	objects []object
-	Start   time.Time
-	End     time.Time
 	config.Job
 	uuid    string
 	runid   string
@@ -62,20 +60,18 @@ type Executor struct {
 }
 
 const (
-	jobName      = "JobName"
-	replica      = "Replica"
-	jobIteration = "Iteration"
-	jobUUID      = "UUID"
-	rcTimeout    = 2
+	jobName              = "JobName"
+	replica              = "Replica"
+	jobIteration         = "Iteration"
+	jobUUID              = "UUID"
+	rcTimeout            = 2
+	garbageCollectionJob = "garbage-collection"
 )
 
 var ClientSet *kubernetes.Clientset
-var waitClientSet *kubernetes.Clientset
 var DynamicClient dynamic.Interface
-var waitDynamicClient dynamic.Interface
 var discoveryClient *discovery.DiscoveryClient
 var restConfig *rest.Config
-var waitRestConfig *rest.Config
 var embedFS embed.FS
 var embedFSDir string
 
@@ -103,11 +99,16 @@ func Run(configSpec config.Spec, prometheusClients []*prometheus.Prometheus, ale
 			var waitListNamespaces []string
 			if job.QPS == 0 || job.Burst == 0 {
 				log.Infof("QPS or Burst rates not set, using default client-go values: %v %v", rest.DefaultQPS, rest.DefaultBurst)
+				job.QPS = rest.DefaultQPS
+				job.Burst = rest.DefaultBurst
 			} else {
 				log.Infof("QPS: %v", job.QPS)
 				log.Infof("Burst: %v", job.Burst)
 			}
 			ClientSet, restConfig, err = config.GetClientSet(job.QPS, job.Burst)
+			if err != nil {
+				log.Fatalf("Error creating clientSet: %s", err)
+			}
 			discoveryClient = discovery.NewDiscoveryClientForConfigOrDie(restConfig)
 			if err != nil {
 				log.Fatalf("Error creating clientSet: %s", err)
@@ -118,7 +119,10 @@ func Run(configSpec config.Spec, prometheusClients []*prometheus.Prometheus, ale
 					log.Fatal(err.Error())
 				}
 			}
-			jobList[jobPosition].Start = time.Now().UTC()
+			prometheusJob := prometheus.Job{
+				Start:     time.Now().UTC(),
+				JobConfig: job.Job,
+			}
 			measurements.SetJobConfig(&job.Job)
 			log.Infof("Triggering job: %s", job.Name)
 			measurements.Start()
@@ -135,6 +139,7 @@ func Run(configSpec config.Spec, prometheusClients []*prometheus.Prometheus, ale
 					log.Infof("Churn duration: %v", job.ChurnDuration)
 					log.Infof("Churn percent: %v", job.ChurnPercent)
 					log.Infof("Churn delay: %v", job.ChurnDelay)
+					log.Infof("Churn deletion strategy: %v", job.ChurnDeletionStrategy)
 				}
 				job.RunCreateJob(0, job.JobIterations, &waitListNamespaces)
 				// If object verification is enabled
@@ -162,19 +167,14 @@ func Run(configSpec config.Spec, prometheusClients []*prometheus.Prometheus, ale
 				time.Sleep(job.JobPause)
 			}
 
-			jobList[jobPosition].End = time.Now().UTC()
+			prometheusJob.End = time.Now().UTC()
 			// Don't append to Prometheus jobList when prometheus it's not initialized
 			if len(prometheusClients) > 0 {
-				prometheusJob := prometheus.Job{
-					Start:     jobList[jobPosition].Start,
-					End:       jobList[jobPosition].End,
-					JobConfig: job.Job,
-				}
 				prometheusJobList = append(prometheusJobList, prometheusJob)
 			}
 			// We stop and index measurements per job
 			if !globalConfig.WaitWhenFinished {
-				elapsedTime := jobList[jobPosition].End.Sub(jobList[jobPosition].Start).Round(time.Second)
+				elapsedTime := prometheusJob.End.Sub(prometheusJob.Start).Round(time.Second)
 				log.Infof("Job %s took %v", job.Name, elapsedTime)
 				if err = measurements.Stop(); err != nil {
 					errs = append(errs, err)
@@ -191,21 +191,49 @@ func Run(configSpec config.Spec, prometheusClients []*prometheus.Prometheus, ale
 				innerRC = 1
 			}
 		}
-		if globalConfig.IndexerConfig.Type != "" {
-			for _, job := range jobList {
-				// elapsedTime is recalculated for every job of the list
-				elapsedTime := job.End.Sub(job.Start).Round(time.Second).Seconds()
-				indexjobSummaryInfo(indexer, uuid, elapsedTime, job.Job, job.Start, metadata)
+		// We initialize garbage collection as soon as the benchmark finishes
+		if globalConfig.GC {
+			// If gcMetrics is enabled, garbage collection must be blocker
+			if globalConfig.GCMetrics {
+				cleanupStart := time.Now().UTC()
+				ctx, cancel := context.WithTimeout(context.Background(), globalConfig.GCTimeout)
+				defer cancel()
+				CleanupNamespaces(ctx, metav1.ListOptions{LabelSelector: fmt.Sprintf("kube-burner-uuid=%v", uuid)}, true)
+				CleanupNonNamespacedResourcesUsingGVR(ctx, jobList, true)
+				// We add an extra dummy job to prometheusJobList to index metrics from this stage
+				cleanupEnd := time.Now().UTC()
+				prometheusJobList = append(prometheusJobList, prometheus.Job{
+					Start: cleanupStart,
+					End:   cleanupEnd,
+					JobConfig: config.Job{
+						Name: garbageCollectionJob,
+					},
+				})
+			} else {
+				go CleanupNonNamespacedResourcesUsingGVR(context.TODO(), jobList, true)
+				go CleanupNamespaces(context.TODO(), metav1.ListOptions{LabelSelector: fmt.Sprintf("kube-burner-uuid=%v", uuid)}, false)
 			}
 		}
-		// We initialize cleanup as soon as the benchmark finishes
-		if globalConfig.GC {
-			go CleanupNamespaces(context.TODO(), metav1.ListOptions{LabelSelector: fmt.Sprintf("kube-burner-uuid=%v", uuid)}, false)
+		if globalConfig.IndexerConfig.Type != "" {
+			for _, job := range prometheusJobList {
+				// elapsedTime is recalculated for every job of the list
+				elapsedTime := job.End.Sub(job.Start).Round(time.Second).Seconds()
+				jobTimings := timings{
+					Timestamp:   job.Start,
+					EndTimstamp: job.End,
+					ElapsedTime: elapsedTime,
+				}
+				if job.JobConfig.SkipIndexing {
+					log.Infof("Skipping job summary indexing in job: %s", job.JobConfig.Name)
+				} else {
+					indexjobSummaryInfo(indexer, uuid, jobTimings, job.JobConfig, metadata)
+				}
+			}
 		}
 		for idx, prometheusClient := range prometheusClients {
 			// If alertManager is configured
 			if alertMs[idx] != nil {
-				if err := alertMs[idx].Evaluate(jobList[0].Start, jobList[len(jobList)-1].End); err != nil {
+				if err := alertMs[idx].Evaluate(prometheusJobList[0].Start, prometheusJobList[len(jobList)-1].End); err != nil {
 					errs = append(errs, err)
 					innerRC = 1
 				}
@@ -213,9 +241,9 @@ func Run(configSpec config.Spec, prometheusClients []*prometheus.Prometheus, ale
 			prometheusClient.JobList = prometheusJobList
 			// If prometheus is enabled query metrics from the start of the first job to the end of the last one
 			if globalConfig.IndexerConfig.Type != "" {
-				metrics.ScrapeMetrics(prometheusClient, indexer)
+				prometheusClient.ScrapeJobsMetrics(indexer)
 				if globalConfig.IndexerConfig.Type == indexers.LocalIndexer && globalConfig.IndexerConfig.CreateTarball {
-					metrics.CreateTarball(globalConfig.IndexerConfig)
+					metrics.CreateTarball(globalConfig.IndexerConfig, globalConfig.IndexerConfig.TarballName)
 				}
 			}
 		}
@@ -230,7 +258,8 @@ func Run(configSpec config.Spec, prometheusClients []*prometheus.Prometheus, ale
 		errs = append(errs, err)
 		rc = rcTimeout
 	}
-	if globalConfig.GC {
+	// When GC is enabled and GCMetrics is disabled, we assume previous GC operation run in background, so we have to ensure there's no garbage left
+	if globalConfig.GC && !globalConfig.GCMetrics {
 		// Use timeout/4 to garbage collect namespaces
 		ctx, cancel := context.WithTimeout(context.Background(), globalConfig.GCTimeout)
 		defer cancel()
@@ -255,7 +284,7 @@ func newExecutorList(configSpec config.Spec, uuid string, timeout time.Duration)
 		case config.CreationJob:
 			ex = setupCreateJob(job)
 		case config.DeletionJob:
-			ex = setupDeleteJob(&job)
+			ex = setupDeleteJob(job)
 		case config.PatchJob:
 			ex = setupPatchJob(job)
 		default:
@@ -284,12 +313,12 @@ func runWaitList(globalWaitMap map[string][]string, executorMap map[string]Execu
 		executor := executorMap[executorUUID]
 		log.Infof("Waiting up to %s for actions to be completed", executor.MaxWaitTimeout)
 		// This semaphore is used to limit the maximum number of concurrent goroutines
-		sem := make(chan int, int(ClientSet.RESTClient().GetRateLimiter().QPS())*2)
+		sem := make(chan int, int(restConfig.QPS))
 		for _, ns := range namespaces {
 			sem <- 1
 			wg.Add(1)
 			go func(ns string) {
-				executor.waitForObjects(ns)
+				executor.waitForObjects(ns, rate.NewLimiter(rate.Limit(restConfig.QPS), restConfig.Burst))
 				<-sem
 				wg.Done()
 			}(ns)

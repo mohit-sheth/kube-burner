@@ -32,18 +32,19 @@ type Auth struct {
 type Prometheus struct {
 	Client        *prometheus.Prometheus
 	Endpoint      string
+	profileName   string
 	MetricProfile []metricDefinition
 	Step          time.Duration
 	UUID          string
 	ConfigSpec    config.Spec
 	JobList       []Job
 	metadata      map[string]interface{}
+	embedConfig   bool
 }
 
 type Job struct {
 	Start     time.Time
 	End       time.Time
-	Name      string
 	JobConfig config.Job
 }
 

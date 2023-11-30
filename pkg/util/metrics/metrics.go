@@ -15,8 +15,6 @@
 package metrics
 
 import (
-	"time"
-
 	"github.com/cloud-bulldozer/go-commons/indexers"
 	"github.com/cloud-bulldozer/kube-burner/pkg/alerting"
 	"github.com/cloud-bulldozer/kube-burner/pkg/prometheus"
@@ -27,16 +25,14 @@ import (
 // Processes common config and executes according to the caller
 func ProcessMetricsScraperConfig(metricsScraperConfig ScraperConfig) Scraper {
 	var err error
-	configSpec := metricsScraperConfig.ConfigSpec
 	var indexer *indexers.Indexer
 	var metricsEndpoints []prometheus.MetricEndpoint
 	var prometheusClients []*prometheus.Prometheus
 	var alertM *alerting.AlertManager
 	var alertMs []*alerting.AlertManager
-	indexerConfig := configSpec.GlobalConfig.IndexerConfig
-	userMetadataContent := make(map[string]interface{})
-	if configSpec.GlobalConfig.IndexerConfig.Type != "" {
-		indexerConfig := configSpec.GlobalConfig.IndexerConfig
+	metadata := make(map[string]interface{})
+	if metricsScraperConfig.ConfigSpec.GlobalConfig.IndexerConfig.Type != "" {
+		indexerConfig := metricsScraperConfig.ConfigSpec.GlobalConfig.IndexerConfig
 		log.Infof("📁 Creating indexer: %s", indexerConfig.Type)
 		indexer, err = indexers.NewIndexer(indexerConfig)
 		if err != nil {
@@ -44,75 +40,59 @@ func ProcessMetricsScraperConfig(metricsScraperConfig ScraperConfig) Scraper {
 		}
 	}
 	if metricsScraperConfig.UserMetaData != "" {
-		userMetadataContent, err = util.ReadUserMetadata(metricsScraperConfig.UserMetaData)
+		metadata, err = util.ReadUserMetadata(metricsScraperConfig.UserMetaData)
 		if err != nil {
 			log.Fatalf("Error reading provided user metadata: %v", err)
 		}
 	}
+	// Combine rawMetadata with user's provided metadata
+	for k, v := range metricsScraperConfig.RawMetadata {
+		metadata[k] = v
+	}
 	// When a metric profile or a alert profile is passed we set up metricsEndpoints
 	if metricsScraperConfig.MetricsEndpoint != "" || metricsScraperConfig.MetricsProfile != "" || metricsScraperConfig.AlertProfile != "" {
-		updateParamIfEmpty(&metricsScraperConfig.MetricsEndpoint, configSpec.GlobalConfig.MetricsEndpoint)
-		updateParamIfEmpty(&metricsScraperConfig.URL, configSpec.GlobalConfig.PrometheusURL)
 		validateMetricsEndpoint(metricsScraperConfig.MetricsEndpoint, metricsScraperConfig.URL)
 		if metricsScraperConfig.MetricsEndpoint != "" {
 			DecodeMetricsEndpoint(metricsScraperConfig.MetricsEndpoint, &metricsEndpoints)
 		} else {
-			updateParamIfEmpty(&metricsScraperConfig.Token, configSpec.GlobalConfig.BearerToken)
 			metricsEndpoints = append(metricsEndpoints, prometheus.MetricEndpoint{
-				Endpoint: metricsScraperConfig.URL,
-				Token:    metricsScraperConfig.Token,
+				Endpoint:     metricsScraperConfig.URL,
+				Token:        metricsScraperConfig.Token,
+				Profile:      metricsScraperConfig.MetricsProfile,
+				AlertProfile: metricsScraperConfig.AlertProfile,
 			})
 		}
 	}
 	for _, metricsEndpoint := range metricsEndpoints {
-		if metricsEndpoint.Profile != "" {
-			configSpec.GlobalConfig.MetricsProfile = metricsEndpoint.Profile
-		} else if metricsScraperConfig.MetricsProfile != "" {
-			configSpec.GlobalConfig.MetricsProfile = metricsScraperConfig.MetricsProfile
-			metricsEndpoint.Profile = metricsScraperConfig.MetricsProfile
-		}
-		metadataContent := map[string]interface{}{}
-		if metricsScraperConfig.ActionIndex {
-			metadataContent = userMetadataContent
-		}
 		auth := prometheus.Auth{
 			Username:      metricsScraperConfig.Username,
 			Password:      metricsScraperConfig.Password,
-			Token:         metricsScraperConfig.Token,
+			Token:         metricsEndpoint.Token,
 			SkipTLSVerify: metricsScraperConfig.SkipTLSVerify,
 		}
-		p, err := prometheus.NewPrometheusClient(configSpec, metricsEndpoint.Endpoint, auth, metricsScraperConfig.PrometheusStep, metadataContent, false)
+		p, err := prometheus.NewPrometheusClient(metricsScraperConfig.ConfigSpec, metricsEndpoint.Endpoint, auth, metricsScraperConfig.PrometheusStep, metadata, false)
 		if err != nil {
 			log.Fatal(err)
 		}
-		if metricsScraperConfig.ActionIndex {
-			p.JobList = []prometheus.Job{{
-				Start: time.Unix(metricsScraperConfig.StartTime, 0),
-				End:   time.Unix(metricsScraperConfig.EndTime, 0),
-				Name:  metricsScraperConfig.JobName,
-			},
+		if metricsEndpoint.Profile != "" {
+			err = p.ReadProfile(metricsEndpoint.Profile)
+			if err != nil {
+				log.Fatal(err)
 			}
-			ScrapeMetrics(p, indexer)
-			if indexerConfig.Type == indexers.LocalIndexer && indexerConfig.CreateTarball {
-				CreateTarball(indexerConfig)
-			}
-		} else {
-			updateParamIfEmpty(&metricsEndpoint.AlertProfile, metricsScraperConfig.AlertProfile)
-			updateParamIfEmpty(&metricsEndpoint.AlertProfile, configSpec.GlobalConfig.AlertProfile)
-			if metricsEndpoint.AlertProfile != "" {
-				if alertM, err = alerting.NewAlertManager(metricsEndpoint.AlertProfile, configSpec.GlobalConfig.UUID, indexer, p, false); err != nil {
-					log.Fatalf("Error creating alert manager: %s", err)
-				}
-			}
-			prometheusClients = append(prometheusClients, p)
-			alertMs = append(alertMs, alertM)
-			alertM = nil
 		}
+		if metricsEndpoint.AlertProfile != "" {
+			if alertM, err = alerting.NewAlertManager(metricsEndpoint.AlertProfile, metricsScraperConfig.ConfigSpec.GlobalConfig.UUID, indexer, p, false); err != nil {
+				log.Fatalf("Error creating alert manager: %s", err)
+			}
+		}
+		prometheusClients = append(prometheusClients, p)
+		alertMs = append(alertMs, alertM)
+		alertM = nil
 	}
 	return Scraper{
-		PrometheusClients:   prometheusClients,
-		AlertMs:             alertMs,
-		Indexer:             indexer,
-		UserMetadataContent: userMetadataContent,
+		PrometheusClients: prometheusClients,
+		AlertMs:           alertMs,
+		Indexer:           indexer,
+		Metadata:          metadata,
 	}
 }

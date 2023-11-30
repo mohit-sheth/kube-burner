@@ -29,6 +29,7 @@ import (
 
 	"github.com/cloud-bulldozer/kube-burner/pkg/config"
 	log "github.com/sirupsen/logrus"
+	"golang.org/x/time/rate"
 
 	"github.com/cloud-bulldozer/kube-burner/pkg/util"
 	kerrors "k8s.io/apimachinery/pkg/api/errors"
@@ -37,18 +38,15 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/client-go/dynamic"
 )
 
 func setupCreateJob(jobConfig config.Job) Executor {
 	var err error
 	var f io.Reader
 	mapper := newRESTMapper()
-	waitClientSet, waitRestConfig, err = config.GetClientSet(jobConfig.QPS*2, jobConfig.Burst*2)
 	if err != nil {
 		log.Fatalf("Error creating wait clientSet: %s", err.Error())
 	}
-	waitDynamicClient = dynamic.NewForConfigOrDie(waitRestConfig)
 	log.Debugf("Preparing create job: %s", jobConfig.Name)
 	ex := Executor{}
 	for _, o := range jobConfig.Objects {
@@ -101,6 +99,7 @@ func setupCreateJob(jobConfig config.Job) Executor {
 
 // RunCreateJob executes a creation job
 func (ex *Executor) RunCreateJob(iterationStart, iterationEnd int, waitListNamespaces *[]string) {
+	waitRateLimiter := rate.NewLimiter(rate.Limit(restConfig.QPS), restConfig.Burst)
 	nsLabels := map[string]string{
 		"kube-burner-job":   ex.Name,
 		"kube-burner-uuid":  ex.uuid,
@@ -143,13 +142,20 @@ func (ex *Executor) RunCreateJob(iterationStart, iterationEnd int, waitListNames
 			}
 		}
 		for objectIndex, obj := range ex.objects {
-			ex.replicaHandler(objectIndex, obj, ns, i, &wg)
+			labels := map[string]string{
+				"kube-burner-uuid":  ex.uuid,
+				"kube-burner-job":   ex.Name,
+				"kube-burner-index": strconv.Itoa(objectIndex),
+				"kube-burner-runid": ex.runid,
+			}
+			ex.objects[objectIndex].labelSelector = labels
+			ex.replicaHandler(labels, obj, ns, i, &wg)
 		}
 		if !ex.WaitWhenFinished && ex.PodWait {
 			if !ex.NamespacedIterations || !namespacesWaited[ns] {
 				log.Infof("Waiting up to %s for actions to be completed in namespace %s", ex.MaxWaitTimeout, ns)
 				wg.Wait()
-				ex.waitForObjects(ns)
+				ex.waitForObjects(ns, waitRateLimiter)
 				namespacesWaited[ns] = true
 			}
 		}
@@ -163,20 +169,19 @@ func (ex *Executor) RunCreateJob(iterationStart, iterationEnd int, waitListNames
 	if ex.WaitWhenFinished {
 		log.Infof("Waiting up to %s for actions to be completed", ex.MaxWaitTimeout)
 		// This semaphore is used to limit the maximum number of concurrent goroutines
-		sem := make(chan int, int(ClientSet.RESTClient().GetRateLimiter().QPS())*2)
+		sem := make(chan int, int(restConfig.QPS))
 		for i := iterationStart; i < iterationEnd; i++ {
 			if ex.NamespacedIterations {
 				ns = ex.generateNamespace(i)
 				if namespacesWaited[ns] {
 					continue
-				} else {
-					namespacesWaited[ns] = true
 				}
+				namespacesWaited[ns] = true
 			}
 			sem <- 1
 			wg.Add(1)
 			go func(ns string) {
-				ex.waitForObjects(ns)
+				ex.waitForObjects(ns, waitRateLimiter)
 				<-sem
 				wg.Done()
 			}(ns)
@@ -197,19 +202,13 @@ func (ex *Executor) generateNamespace(iteration int) string {
 	return fmt.Sprintf("%s-%d", ex.Namespace, nsIndex)
 }
 
-func (ex *Executor) replicaHandler(objectIndex int, obj object, ns string, iteration int, replicaWg *sync.WaitGroup) {
+func (ex *Executor) replicaHandler(labels map[string]string, obj object, ns string, iteration int, replicaWg *sync.WaitGroup) {
 	var wg sync.WaitGroup
 	for r := 1; r <= obj.Replicas; r++ {
 		wg.Add(1)
 		go func(r int) {
 			defer wg.Done()
 			var newObject = new(unstructured.Unstructured)
-			labels := map[string]string{
-				"kube-burner-uuid":  ex.uuid,
-				"kube-burner-job":   ex.Name,
-				"kube-burner-index": strconv.Itoa(objectIndex),
-				"kube-burner-runid": ex.runid,
-			}
 			templateData := map[string]interface{}{
 				jobName:      ex.Name,
 				jobIteration: iteration,
@@ -264,10 +263,18 @@ func createRequest(gvr schema.GroupVersionResource, ns string, obj *unstructured
 				log.Fatalf("Authorization error creating %s/%s: %s", obj.GetKind(), obj.GetName(), err)
 				return true, err
 			} else if kerrors.IsAlreadyExists(err) {
-				log.Errorf("%s/%s in namespace %s already exists", obj.GetKind(), obj.GetName(), ns)
+				if ns != "" {
+					log.Errorf("%s/%s in namespace %s already exists", obj.GetKind(), obj.GetName(), ns)
+				} else {
+					log.Errorf("%s/%s already exists", obj.GetKind(), obj.GetName())
+				}
 				return true, nil
 			} else if err != nil {
-				log.Errorf("Error creating object %s/%s in namespace %s: %s", obj.GetKind(), obj.GetName(), ns, err)
+				if ns != "" {
+					log.Errorf("Error creating object %s/%s in namespace %s: %s", obj.GetKind(), obj.GetName(), ns, err)
+				} else {
+					log.Errorf("Error creating object %s/%s: %s", obj.GetKind(), obj.GetName(), err)
+				}
 			}
 			log.Error("Retrying object creation")
 			return false, nil
@@ -287,7 +294,7 @@ func (ex *Executor) RunCreateJobWithChurn() {
 	// Determine the number of job iterations to churn (min 1)
 	numToChurn := int(math.Max(float64(ex.ChurnPercent*ex.JobIterations/100), 1))
 	now := time.Now().UTC()
-	rand.Seed(now.UnixNano())
+	rand.NewSource(now.UnixNano())
 	// Create timer for the churn duration
 	timer := time.After(ex.ChurnDuration)
 	// Patch to label namespaces for deletion
@@ -308,6 +315,7 @@ func (ex *Executor) RunCreateJobWithChurn() {
 			numToChurn = ex.JobIterations
 		}
 		var namespacesPatched = make(map[string]bool)
+		var namespacesToDelete []string
 		// delete numToChurn namespaces starting at randStart
 		for i := randStart; i < numToChurn+randStart; i++ {
 			ns := ex.generateNamespace(i)
@@ -320,11 +328,15 @@ func (ex *Executor) RunCreateJobWithChurn() {
 				log.Errorf("Error patching namespace %s. Error: %v", ns, err)
 			}
 			namespacesPatched[ns] = true
+			namespacesToDelete = append(namespacesToDelete, ns)
 		}
 		// 1 hour timeout to delete namespaces
 		ctx, cancel := context.WithTimeout(context.Background(), time.Hour)
 		defer cancel()
-		// Delete namespaces based on the label we added
+		// Cleanup namespaces based on the labels we added
+		if ex.ChurnDeletionStrategy == "gvr" {
+			CleanupNamespaceResourcesUsingGVR(ctx, ex.objects, namespacesToDelete, ex.Name)
+		}
 		CleanupNamespaces(ctx, metav1.ListOptions{LabelSelector: "churndelete=delete"}, true)
 		log.Info("Re-creating deleted objects")
 		// Re-create objects that were deleted

@@ -15,6 +15,7 @@
 package measurements
 
 import (
+	"context"
 	"fmt"
 	"math"
 	"sort"
@@ -28,7 +29,8 @@ import (
 	"github.com/cloud-bulldozer/kube-burner/pkg/measurements/types"
 	log "github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
-	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/cache"
 )
@@ -76,24 +78,21 @@ func (p *podLatency) handleCreatePod(obj interface{}) {
 	p.metricLock.Lock()
 	defer p.metricLock.Unlock()
 	if _, exists := p.metrics[string(pod.UID)]; !exists {
-		timestamp, isValid := validatePod(factory.jobConfig.JobType, pod)
-		if isValid {
-			p.metrics[string(pod.UID)] = podMetric{
-				Timestamp:  timestamp,
-				Namespace:  pod.Namespace,
-				Name:       pod.Name,
-				MetricName: podLatencyMeasurement,
-				UUID:       globalCfg.UUID,
-				JobConfig:  *factory.jobConfig,
-				JobName:    factory.jobConfig.Name,
-				Metadata:   factory.metadata,
-			}
+		p.metrics[string(pod.UID)] = podMetric{
+			Timestamp:  pod.CreationTimestamp.Time.UTC(),
+			Namespace:  pod.Namespace,
+			Name:       pod.Name,
+			MetricName: podLatencyMeasurement,
+			UUID:       globalCfg.UUID,
+			JobConfig:  *factory.jobConfig,
+			JobName:    factory.jobConfig.Name,
+			Metadata:   factory.metadata,
 		}
 	}
 }
 
 func (p *podLatency) handleUpdatePod(obj interface{}) {
-	pod := obj.(*v1.Pod)
+	pod := obj.(*corev1.Pod)
 	p.metricLock.Lock()
 	defer p.metricLock.Unlock()
 	if pm, exists := p.metrics[string(pod.UID)]; exists && pm.podReady.IsZero() {
@@ -136,6 +135,10 @@ func (p *podLatency) setConfig(cfg types.Measurement) error {
 // start starts podLatency measurement
 func (p *podLatency) start(measurementWg *sync.WaitGroup) {
 	defer measurementWg.Done()
+	if factory.jobConfig.JobType == config.DeletionJob {
+		log.Info("Pod latency measurement not compatible with delete jobs, skipping")
+		return
+	}
 	p.metrics = make(map[string]podMetric)
 	log.Infof("Creating Pod latency watcher for %s", factory.jobConfig.Name)
 	p.watcher = metrics.NewWatcher(
@@ -143,6 +146,9 @@ func (p *podLatency) start(measurementWg *sync.WaitGroup) {
 		"podWatcher",
 		"pods",
 		corev1.NamespaceAll,
+		func(options *metav1.ListOptions) {
+			options.LabelSelector = fmt.Sprintf("kube-burner-runid=%s", globalCfg.RUNID)
+		},
 	)
 	p.watcher.Informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc: p.handleCreatePod,
@@ -155,10 +161,64 @@ func (p *podLatency) start(measurementWg *sync.WaitGroup) {
 	}
 }
 
+// collects pod measurements triggered in the past
+func (p *podLatency) collect(measurementWg *sync.WaitGroup) {
+	defer measurementWg.Done()
+	var pods []corev1.Pod
+	labelSelector := labels.SelectorFromSet(factory.jobConfig.NamespaceLabels)
+	options := metav1.ListOptions{
+		LabelSelector: labelSelector.String(),
+	}
+	namespaces := strings.Split(factory.jobConfig.Namespace, ",")
+	for _, namespace := range namespaces {
+		podList, err := factory.clientSet.CoreV1().Pods(namespace).List(context.TODO(), options)
+		if err != nil {
+			log.Errorf("error listing pods in namespace %s: %v", namespace, err)
+		}
+		pods = append(pods, podList.Items...)
+	}
+	p.metrics = make(map[string]podMetric)
+	for _, pod := range pods {
+		var scheduled, initialized, containersReady, podReady time.Time
+		for _, c := range pod.Status.Conditions {
+			switch c.Type {
+			case corev1.PodScheduled:
+				scheduled = c.LastTransitionTime.Time.UTC()
+			case corev1.PodInitialized:
+				initialized = c.LastTransitionTime.Time.UTC()
+			case corev1.ContainersReady:
+				containersReady = c.LastTransitionTime.Time.UTC()
+			case corev1.PodReady:
+				podReady = c.LastTransitionTime.Time.UTC()
+			}
+		}
+		p.metrics[string(pod.UID)] = podMetric{
+			Timestamp:       pod.Status.StartTime.Time.UTC(),
+			Namespace:       pod.Namespace,
+			Name:            pod.Name,
+			MetricName:      podLatencyMeasurement,
+			NodeName:        pod.Spec.NodeName,
+			UUID:            globalCfg.UUID,
+			JobConfig:       *factory.jobConfig,
+			JobName:         factory.jobConfig.Name,
+			Metadata:        factory.metadata,
+			scheduled:       scheduled,
+			initialized:     initialized,
+			containersReady: containersReady,
+			podReady:        podReady,
+		}
+	}
+}
+
 // Stop stops podLatency measurement
 func (p *podLatency) stop() error {
+	if factory.jobConfig.JobType == config.DeletionJob {
+		return nil
+	}
 	var err error
-	p.watcher.StopWatcher()
+	if p.watcher != nil {
+		p.watcher.StopWatcher()
+	}
 	errorRate := p.normalizeMetrics()
 	if errorRate > 10.00 {
 		log.Error("Latency errors beyond 10%. Hence invalidating the results")
@@ -169,14 +229,19 @@ func (p *podLatency) stop() error {
 		err = metrics.CheckThreshold(p.config.LatencyThresholds, p.latencyQuantiles)
 	}
 	if globalCfg.IndexerConfig.Type != "" {
-		log.Infof("Indexing pod latency data for job: %s", factory.jobConfig.Name)
-		p.index()
+		if factory.jobConfig.SkipIndexing {
+			log.Infof("Skipping pod latency data indexing in job: %s", factory.jobConfig.Name)
+		} else {
+			p.index()
+		}
 	}
 	for _, q := range p.latencyQuantiles {
 		pq := q.(metrics.LatencyQuantiles)
 		log.Infof("%s: %s 50th: %v 99th: %v max: %v avg: %v", factory.jobConfig.Name, pq.QuantileName, pq.P50, pq.P99, pq.Max, pq.Avg)
 	}
-	log.Infof("Pod latencies error rate was: %.2f", errorRate)
+	if len(p.latencyQuantiles) > 0 {
+		log.Infof("Pod latencies error rate was: %.2f", errorRate)
+	}
 	// Reset latency slices, required in multi-job benchmarks
 	p.latencyQuantiles, p.normLatencies = nil, nil
 	return err
@@ -184,6 +249,7 @@ func (p *podLatency) stop() error {
 
 // index sends metrics to the configured indexer
 func (p *podLatency) index() {
+	log.Infof("Indexing pod latency data for job: %s", factory.jobConfig.Name)
 	metricMap := map[string][]interface{}{
 		podLatencyMeasurement:          p.normLatencies,
 		podLatencyQuantilesMeasurement: p.latencyQuantiles,
@@ -195,7 +261,7 @@ func (p *podLatency) index() {
 		indexingOpts := indexers.IndexingOpts{
 			MetricName: fmt.Sprintf("%s-%s", metricName, factory.jobConfig.Name),
 		}
-		log.Debugf("Indexing [%d] documents", len(data))
+		log.Debugf("Indexing [%d] documents: %s", len(data), metricName)
 		resp, err := (*factory.indexer).Index(data, indexingOpts)
 		if err != nil {
 			log.Error(err.Error())
@@ -317,17 +383,4 @@ func (p *podLatency) validateConfig() error {
 		}
 	}
 	return nil
-}
-
-// validatePod validates a pod based on job type and returns its timestamp for latency calculation.
-// It returns a timestamp and a boolean value indicating validation details.
-func validatePod(jobType config.JobType, pod *v1.Pod) (time.Time, bool) {
-	if jobType == config.CreationJob {
-		runid, exists := pod.Labels["kube-burner-runid"]
-		if exists && runid == globalCfg.RUNID {
-			return pod.CreationTimestamp.Time.UTC(), true
-		}
-		return pod.CreationTimestamp.Time.UTC(), false
-	}
-	return pod.Status.StartTime.Time.UTC(), true
 }

@@ -29,6 +29,7 @@ import (
 	"github.com/cloud-bulldozer/kube-burner/pkg/alerting"
 	"github.com/cloud-bulldozer/kube-burner/pkg/burner"
 	"github.com/cloud-bulldozer/kube-burner/pkg/config"
+	"github.com/cloud-bulldozer/kube-burner/pkg/measurements"
 	"github.com/cloud-bulldozer/kube-burner/pkg/util"
 	"github.com/cloud-bulldozer/kube-burner/pkg/util/metrics"
 
@@ -37,7 +38,9 @@ import (
 
 	uid "github.com/satori/go.uuid"
 	"github.com/spf13/cobra"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/dynamic"
 	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
@@ -131,7 +134,7 @@ func initCmd() *cobra.Command {
 					UserMetaData:    userMetadata,
 				})
 			}
-			rc, err = burner.Run(configSpec, metricsScraper.PrometheusClients, metricsScraper.AlertMs, metricsScraper.Indexer, timeout, metricsScraper.UserMetadataContent)
+			rc, err = burner.Run(configSpec, metricsScraper.PrometheusClients, metricsScraper.AlertMs, metricsScraper.Indexer, timeout, metricsScraper.Metadata)
 			if err != nil {
 				log.Errorf(err.Error())
 				os.Exit(rc)
@@ -190,6 +193,79 @@ func destroyCmd() *cobra.Command {
 	return cmd
 }
 
+func measureCmd() *cobra.Command {
+	var uuid string
+	var rawNamespaces string
+	var selector string
+	var configFile string
+	var jobName string
+	var userMetadata string
+	var indexer *indexers.Indexer
+	metadata := make(map[string]interface{})
+	cmd := &cobra.Command{
+		Use:   "measure",
+		Short: "Take measurements for a given set of resources without running workload",
+		PostRun: func(cmd *cobra.Command, args []string) {
+			log.Info("👋 Exiting kube-burner ", uuid)
+		},
+		Args: cobra.NoArgs,
+		Run: func(cmd *cobra.Command, args []string) {
+			f, err := util.ReadConfig(configFile)
+			if err != nil {
+				log.Fatalf("Error reading configuration file %s: %s", configFile, err)
+			}
+			configSpec, err := config.Parse(configFile, f)
+			if err != nil {
+				log.Fatal(err.Error())
+			}
+			if len(configSpec.Jobs) > 0 {
+				log.Fatal("No jobs are allowed in a measure subcommand config file")
+			}
+			if configSpec.GlobalConfig.IndexerConfig.Type != "" {
+				indexerConfig := configSpec.GlobalConfig.IndexerConfig
+				log.Infof("📁 Creating indexer: %s", indexerConfig.Type)
+				indexer, err = indexers.NewIndexer(indexerConfig)
+				if err != nil {
+					log.Fatalf("%v indexer: %v", indexerConfig.Type, err.Error())
+				}
+			}
+			if userMetadata != "" {
+				metadata, err = util.ReadUserMetadata(userMetadata)
+				if err != nil {
+					log.Fatalf("Error reading provided user metadata: %v", err)
+				}
+			}
+			labelSelector, err := labels.Parse(selector)
+			if err != nil {
+				log.Fatalf("Invalid selector: %v", err)
+			}
+			namespaceLabels := make(map[string]string)
+			labelRequirements, _ := labelSelector.Requirements()
+			for _, req := range labelRequirements {
+				namespaceLabels[req.Key()] = req.Values().List()[0]
+			}
+			log.Infof("%v", namespaceLabels)
+			measurements.NewMeasurementFactory(configSpec, indexer, metadata)
+			measurements.SetJobConfig(&config.Job{
+				Name:            jobName,
+				Namespace:       rawNamespaces,
+				NamespaceLabels: namespaceLabels,
+			})
+			measurements.Collect()
+			if err = measurements.Stop(); err != nil {
+				log.Error(err.Error())
+			}
+		},
+	}
+	cmd.Flags().StringVar(&uuid, "uuid", "", "UUID")
+	cmd.Flags().StringVar(&userMetadata, "user-metadata", "", "User provided metadata file, in YAML format")
+	cmd.Flags().StringVarP(&configFile, "config", "c", "config.yml", "Config file path or URL")
+	cmd.Flags().StringVarP(&jobName, "job-name", "j", "kube-burner-measure", "Measure job name")
+	cmd.Flags().StringVarP(&rawNamespaces, "namespaces", "n", corev1.NamespaceAll, "comma-separated list of namespaces")
+	cmd.Flags().StringVarP(&selector, "selector", "l", "", "namespace label selector. (e.g. -l key1=value1,key2=value2)")
+	return cmd
+}
+
 func indexCmd() *cobra.Command {
 	var url, metricsEndpoint, metricsProfile, jobName string
 	var start, end int64
@@ -198,6 +274,7 @@ func indexCmd() *cobra.Command {
 	var configSpec config.Spec
 	var skipTLSVerify bool
 	var prometheusStep time.Duration
+	var tarballName string
 	cmd := &cobra.Command{
 		Use:   "index",
 		Short: "Index kube-burner metrics",
@@ -220,7 +297,7 @@ func indexCmd() *cobra.Command {
 					MetricsDirectory: metricsDirectory,
 				}
 			}
-			_ = metrics.ProcessMetricsScraperConfig(metrics.ScraperConfig{
+			metricsScraper := metrics.ProcessMetricsScraperConfig(metrics.ScraperConfig{
 				ConfigSpec:      configSpec,
 				Password:        password,
 				PrometheusStep:  prometheusStep,
@@ -230,12 +307,26 @@ func indexCmd() *cobra.Command {
 				URL:             url,
 				Token:           token,
 				Username:        username,
-				StartTime:       start,
-				EndTime:         end,
-				JobName:         jobName,
-				ActionIndex:     true,
 				UserMetaData:    userMetadata,
 			})
+			for _, prometheusClients := range metricsScraper.PrometheusClients {
+				prometheusJob := prometheus.Job{
+					Start: time.Unix(start, 0),
+					End:   time.Unix(end, 0),
+					JobConfig: config.Job{
+						Name: jobName,
+					},
+				}
+				prometheusClients.JobList = append(prometheusClients.JobList, prometheusJob)
+				if err := prometheusClients.ScrapeJobsMetrics(metricsScraper.Indexer); err != nil {
+					log.Fatal(err)
+				}
+			}
+			if configSpec.GlobalConfig.IndexerConfig.Type == indexers.LocalIndexer && tarballName != "" {
+				if err := metrics.CreateTarball(configSpec.GlobalConfig.IndexerConfig, tarballName); err != nil {
+					log.Fatal(err)
+				}
+			}
 		},
 	}
 	cmd.Flags().StringVar(&uuid, "uuid", uid.NewV4().String(), "Benchmark UUID")
@@ -254,6 +345,7 @@ func indexCmd() *cobra.Command {
 	cmd.Flags().StringVar(&metricsDirectory, "metrics-directory", "collected-metrics", "Directory to dump the metrics files in, when using default local indexing")
 	cmd.Flags().StringVar(&esServer, "es-server", "", "Elastic Search endpoint")
 	cmd.Flags().StringVar(&esIndex, "es-index", "", "Elastic Search index")
+	cmd.Flags().StringVar(&tarballName, "tarball-name", "", "Dump collected metrics into a tarball with the given name, requires local indexing")
 	cmd.Flags().SortFlags = false
 	return cmd
 }
@@ -349,7 +441,6 @@ func alertCmd() *cobra.Command {
 			if alertM, err = alerting.NewAlertManager(alertProfile, uuid, indexer, p, false); err != nil {
 				log.Fatalf("Error creating alert manager: %s", err)
 			}
-
 			err = alertM.Evaluate(startTime, endTime)
 			log.Info("👋 Exiting kube-burner ", uuid)
 			if err != nil {
@@ -381,6 +472,7 @@ func main() {
 	rootCmd.AddCommand(
 		versionCmd,
 		initCmd(),
+		measureCmd(),
 		destroyCmd(),
 		indexCmd(),
 		alertCmd(),
